@@ -36,8 +36,8 @@ Add two files with the names `docker-compose.yml` and `.env`. Paste their conten
 
 <Accordions>
 <Accordion title="docker-compose.yml">
-```yaml
 
+```yaml
 # This file is a minimal plug and play working example of a runnable OpenShock stack.
 #
 # Configuration lives in the .env file next to this compose file. You edit simple
@@ -62,8 +62,9 @@ Add two files with the names `docker-compose.yml` and `.env`. Paste their conten
 # The `${OPENSHOCK_PORT:+:...}` bits append ":port" only when a custom port is set,
 # so default (443) deployments keep clean https://host URLs.
 # ---------------------------------------------------------------------------
+
+# Core infrastructure
 x-openshock-env: &openshock-env
-  # Core infrastructure
   OPENSHOCK__DB__CONN: Host=db;Port=5432;Database=${PG_DB:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
   OPENSHOCK__REDIS__HOST: dragonfly
 
@@ -106,7 +107,6 @@ x-openshock-svc: &openshock-svc
     - dragonfly
 
 services:
-
   db: # We need a postgres database, preferably version 18+
     image: postgres:18
     restart: unless-stopped
@@ -118,7 +118,7 @@ services:
       retries: 5
       timeout: 5s
     networks:
-     - openshock
+      - openshock
     environment:
       POSTGRES_PASSWORD: ${PG_PASS:?database password required}
       POSTGRES_USER: ${PG_USER:-openshock}
@@ -132,7 +132,7 @@ services:
     command: "--notify_keyspace_events=Ex"
     restart: unless-stopped
     networks:
-     - openshock
+      - openshock
     volumes:
       - ./dragonfly-data:/data
 
@@ -203,7 +203,7 @@ services:
       - "traefik.http.routers.openshock-cron.entrypoints=https"
       - "traefik.http.routers.openshock-cron.tls=true"
       - "traefik.http.routers.openshock-cron.service=openshock-cron"
-      - "traefik.http.services.openshock-cron.loadbalancer.server.port=780"
+      - "traefik.http.services.openshock-cron.loadbalancer.server.port=80"
 
   traefik:
     image: traefik:latest
@@ -228,13 +228,14 @@ services:
 
 networks:
   openshock:
+```
 
-````
 </Accordion>
 </Accordions>
 <Accordions>
 <Accordion title=".env">
-``` yaml
+
+```yaml
 # OpenShock configuration. These are simple knobs; docker-compose.yml maps them
 # onto the OPENSHOCK__* variables the containers read and shares them across every
 # service. Anything left unset falls back to the defaults defined in the compose file.
@@ -317,21 +318,21 @@ If you are running the previous subdomain-based stack (`api.example.com` /
 `gateway.example.com` plus the `webui` container), read this before you pull.
 
 <Callout type="warn" title="Back up first">
-  Back up your `postgres-data` folder before starting. The Postgres upgrade and the
-  volume path change below both touch persistent data.
+  Back up your `postgres-data` folder before starting. The Postgres upgrade and the volume path
+  change below both touch persistent data.
 </Callout>
 
 ### What changed
 
-| Old                                                    | New                                                                   |
-| ------------------------------------------------------ | --------------------------------------------------------------------- |
-| Subdomains: `api.`, `gateway.`, UI on the root          | One host, one port, split by path: `/api`, `/gateway`, UI on `/`       |
-| `webui` container (`ghcr.io/openshock/webui`, port 80)  | `frontend` container (`ghcr.io/openshock/frontend`, port 3000)         |
-| `redis/redis-stack-server`, keyspace events `KEA`       | DragonflyDB, keyspace events `Ex`                                      |
-| `postgres:17`, volume at `/var/lib/postgresql/data`     | `postgres:18`, volume at `/var/lib/postgresql`                         |
-| `.env` holds raw `OPENSHOCK__*` variables               | `.env` holds short knobs, the compose file maps them to `OPENSHOCK__*` |
-| Images pinned to `latest`                               | `OPENSHOCK_TAG` / `OPENSHOCK_FRONTEND_TAG`                             |
-| Traefik `redirectregex` rules for `/s/`, `/c/`, `/t/`   | Handled by the frontend itself (`/c/` is now `/usc/`)                  |
+| Old                                                    | New                                                                    |
+| ------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Subdomains: `api.`, `gateway.`, UI on the root         | One host, one port, split by path: `/api`, `/gateway`, UI on `/`       |
+| `webui` container (`ghcr.io/openshock/webui`, port 80) | `frontend` container (`ghcr.io/openshock/frontend`, port 3000)         |
+| `redis/redis-stack-server`, keyspace events `KEA`      | DragonflyDB, keyspace events `Ex`                                      |
+| `postgres:17`, volume at `/var/lib/postgresql/data`    | `postgres:18`, volume at `/var/lib/postgresql`                         |
+| `.env` holds raw `OPENSHOCK__*` variables              | `.env` holds short knobs, the compose file maps them to `OPENSHOCK__*` |
+| Images pinned to `latest`                              | `OPENSHOCK_TAG` / `OPENSHOCK_FRONTEND_TAG`                             |
+| Traefik `redirectregex` rules for `/s/`, `/c/`, `/t/`  | Handled by the frontend itself (`/c/` is now `/usc/`)                  |
 
 ### 1. Postgres 17 → 18
 
@@ -369,27 +370,27 @@ restore your dump into `PG_DB`.
 
 Copy the new `.env` from above and port your values across:
 
-| Old (`.env`)                                       | New (`.env`)                                                                                            |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `OPENSHOCK_DOMAIN`                                  | `OPENSHOCK_HOST`                                                                                          |
-| `OPENSHOCK_API_SUBDOMAIN`                           | `OPENSHOCK_API_PATH` (default `/api`)                                                                     |
-| `OPENSHOCK_GATEWAY_SUBDOMAIN`                       | `OPENSHOCK_GATEWAY_PATH` (default `/gateway`)                                                             |
-| `OPENSHOCK__MAIL__TYPE=SMTP`                        | `MAIL_TYPE=Smtp` — or `Mailjet`, or `None` for no outbound mail                                           |
-| `OPENSHOCK__MAIL__SENDER__NAME` / `__EMAIL`         | `MAIL_SENDER_NAME` / `MAIL_SENDER_EMAIL`                                                                  |
-| `OPENSHOCK__MAIL__SMTP__*`                          | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_ENABLESSL`, `SMTP_VERIFYCERTIFICATE`    |
-| `OPENSHOCK__MAIL__MAILJET__KEY` / `__SECRET`        | `MAILJET_KEY` / `MAILJET_SECRET`                                                                          |
-| `OPENSHOCK__MAIL__MAILJET__TEMPLATE__PASSWORDRESET` | Gone — mail templates are generated now                                                                   |
-| `OPENSHOCK__TURNSTILE__ENABLE`                      | `OPENSHOCK_TURNSTILE_ENABLE`                                                                              |
-| `OPENSHOCK__ACCOUNT__REGISTRATIONENABLED`           | `OPENSHOCK_REGISTRATION_ENABLED`                                                                          |
-| `OPENSHOCK__LCG__COUNTRYCODE`                       | `OPENSHOCK_LCG_COUNTRYCODE`                                                                               |
+| Old (`.env`)                                        | New (`.env`)                                                                                           |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `OPENSHOCK_DOMAIN`                                  | `OPENSHOCK_HOST`                                                                                       |
+| `OPENSHOCK_API_SUBDOMAIN`                           | `OPENSHOCK_API_PATH` (default `/api`)                                                                  |
+| `OPENSHOCK_GATEWAY_SUBDOMAIN`                       | `OPENSHOCK_GATEWAY_PATH` (default `/gateway`)                                                          |
+| `OPENSHOCK__MAIL__TYPE=SMTP`                        | `MAIL_TYPE=Smtp` — or `Mailjet`, or `None` for no outbound mail                                        |
+| `OPENSHOCK__MAIL__SENDER__NAME` / `__EMAIL`         | `MAIL_SENDER_NAME` / `MAIL_SENDER_EMAIL`                                                               |
+| `OPENSHOCK__MAIL__SMTP__*`                          | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_ENABLESSL`, `SMTP_VERIFYCERTIFICATE` |
+| `OPENSHOCK__MAIL__MAILJET__KEY` / `__SECRET`        | `MAILJET_KEY` / `MAILJET_SECRET`                                                                       |
+| `OPENSHOCK__MAIL__MAILJET__TEMPLATE__PASSWORDRESET` | Gone — mail templates are generated now                                                                |
+| `OPENSHOCK__TURNSTILE__ENABLE`                      | `OPENSHOCK_TURNSTILE_ENABLE`                                                                           |
+| `OPENSHOCK__ACCOUNT__REGISTRATIONENABLED`           | `OPENSHOCK_REGISTRATION_ENABLED`                                                                       |
+| `OPENSHOCK__LCG__COUNTRYCODE`                       | `OPENSHOCK_LCG_COUNTRYCODE`                                                                            |
 
 `PG_PASS`, `PG_USER` and `PG_DB` keep their names.
 
 <Callout type="warn" title="Extra variables no longer pass through">
-  The old `api` service had `env_file: .env`, so any extra `OPENSHOCK__*` variable you
-  dropped into `.env` reached the container automatically. It does not anymore. Anything
-  not in the table above has to be added explicitly to the `x-openshock-env` block
-  (shared by api, cron and lcg) or to the individual service.
+  The old `api` service had `env_file: .env`, so any extra `OPENSHOCK__*` variable you dropped into
+  `.env` reached the container automatically. It does not anymore. Anything not in the table above
+  has to be added explicitly to the `x-openshock-env` block (shared by api, cron and lcg) or to the
+  individual service.
 </Callout>
 
 New knobs worth knowing:
