@@ -16,11 +16,12 @@ Hardware:
 
 Software:
 
-1. `Docker` and `docker compose` installed on the server. You can use the [Docker install script](https://github.com/docker/docker-install) for linux, or [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows.
+1. `docker` and `docker compose` installed on the server. You can use the [Docker install script](https://github.com/docker/docker-install) for linux, or [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows.  
+   Alternatively podman or podman desktop with compose addon.
 
 Other:
 
-1. Domain name, setup to pointed towards your server.
+1. A domain or subdomain is recommended.
 2. HTTPS - required for cookies to work securely. You can use cloudflare for lets encrypt for example.
 
 ## Preparing the server
@@ -38,107 +39,195 @@ Add two files with the names `docker-compose.yml` and `.env`. Paste their conten
 ```yaml
 
 # This file is a minimal plug and play working example of a runnable OpenShock stack.
+#
+# Configuration lives in the .env file next to this compose file. You edit simple
+# KEY=value knobs there (host, port, per-service paths, DB password, mail...). This
+# file maps those onto the OPENSHOCK__* / PUBLIC_* config the containers read.
+#
+# Topology: the whole stack runs on ONE host (OPENSHOCK_HOST) and ONE port
+# (OPENSHOCK_PORT, default 443), and the services are told apart by path:
+#   https://host/           -> frontend
+#   https://host/api/...    -> api        (OPENSHOCK_API_PATH)
+#   https://host/gateway/.. -> gateway    (OPENSHOCK_GATEWAY_PATH)
+# Because everything is one origin, the login cookie is shared with no extra setup.
+# Each app owns its path prefix (UsePathBase); Traefik routes by PathPrefix and does
+# NOT strip. Shared OPENSHOCK__* config lives in x-openshock-env, merged into each
+# service; the `:-default` fallbacks keep the stack booting with almost no config.
+
+# ---------------------------------------------------------------------------
+# Shared application config. Every OpenShock service (api, cron, lcg) reads the
+# same OPENSHOCK__* schema, so it is defined once here and merged into each
+# service with `<<: *openshock-env`. Values come from the knobs in .env; the
+# `:-default` fallbacks keep the stack booting with almost no configuration.
+# The `${OPENSHOCK_PORT:+:...}` bits append ":port" only when a custom port is set,
+# so default (443) deployments keep clean https://host URLs.
+# ---------------------------------------------------------------------------
+x-openshock-env: &openshock-env
+  # Core infrastructure
+  OPENSHOCK__DB__CONN: Host=db;Port=5432;Database=${PG_DB:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
+  OPENSHOCK__REDIS__HOST: dragonfly
+
+  # Frontend URLs — API uses them for cookies/redirects, Cron for e-mail links.
+  # BASEURL/SHORTURL point at the web UI (host + optional port + frontend path).
+  # COOKIEDOMAIN is the bare host; since the whole stack is one origin the login
+  # cookie is shared with every service automatically.
+  OPENSHOCK__FRONTEND__BASEURL: https://${OPENSHOCK_HOST:-openshock.local}${OPENSHOCK_PORT:+:${OPENSHOCK_PORT}}${OPENSHOCK_FRONTEND_PATH:-}
+  OPENSHOCK__FRONTEND__SHORTURL: https://${OPENSHOCK_HOST:-openshock.local}${OPENSHOCK_PORT:+:${OPENSHOCK_PORT}}${OPENSHOCK_FRONTEND_PATH:-}
+  OPENSHOCK__FRONTEND__COOKIEDOMAIN: ${OPENSHOCK_HOST:-openshock.local}
+
+  # Feature flags
+  OPENSHOCK__TURNSTILE__ENABLE: ${OPENSHOCK_TURNSTILE_ENABLE:-false}
+  OPENSHOCK__ACCOUNT__REGISTRATIONENABLED: ${OPENSHOCK_REGISTRATION_ENABLED:-true}
+
+  # E-mail (delivered by the Cron service). TYPE is required by the app; leave it
+  # as None to run without outbound mail, or set MAIL_TYPE=Smtp / Mailjet in .env
+  # and fill in the matching block below.
+  OPENSHOCK__MAIL__TYPE: ${MAIL_TYPE:-None}
+  OPENSHOCK__MAIL__SENDER__NAME: ${MAIL_SENDER_NAME:-OpenShock}
+  OPENSHOCK__MAIL__SENDER__EMAIL: ${MAIL_SENDER_EMAIL:-no-reply@openshock.local}
+  # SMTP (used when MAIL_TYPE=Smtp)
+  OPENSHOCK__MAIL__SMTP__HOST: ${SMTP_HOST:-}
+  OPENSHOCK__MAIL__SMTP__PORT: ${SMTP_PORT:-587}
+  OPENSHOCK__MAIL__SMTP__USERNAME: ${SMTP_USERNAME:-}
+  OPENSHOCK__MAIL__SMTP__PASSWORD: ${SMTP_PASSWORD:-}
+  OPENSHOCK__MAIL__SMTP__ENABLESSL: ${SMTP_ENABLESSL:-true}
+  OPENSHOCK__MAIL__SMTP__VERIFYCERTIFICATE: ${SMTP_VERIFYCERTIFICATE:-true}
+  # Mailjet (used when MAIL_TYPE=Mailjet)
+  OPENSHOCK__MAIL__MAILJET__KEY: ${MAILJET_KEY:-}
+  OPENSHOCK__MAIL__MAILJET__SECRET: ${MAILJET_SECRET:-}
+
+# Common scaffolding shared by the OpenShock app services.
+x-openshock-svc: &openshock-svc
+  restart: unless-stopped
+  networks:
+    - openshock
+  depends_on:
+    - db
+    - dragonfly
 
 services:
 
-db: # We need a postgres database, preferably version 15+
-image: postgres:17
-restart: unless-stopped
-container_name: openshock-postgres
-healthcheck:
-test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
-start_period: 20s
-interval: 30s
-retries: 5
-timeout: 5s
-networks: - openshock
-environment:
-POSTGRES_PASSWORD: ${PG_PASS:?database password required}
-POSTGRES_USER: ${PG_USER:-openshock}
-POSTGRES_DB: ${PG_DB:-openshock}
-volumes: - ./postgres-data:/var/lib/postgresql/data # Data is saved in a folder called postgres-data in the current working directory
+  db: # We need a postgres database, preferably version 18+
+    image: postgres:18
+    restart: unless-stopped
+    container_name: openshock-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    networks:
+     - openshock
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS:?database password required}
+      POSTGRES_USER: ${PG_USER:-openshock}
+      POSTGRES_DB: ${PG_DB:-openshock}
+    volumes:
+      # PG18+ mounts the parent dir (data lives in ./postgres-data/18/docker).
+      - ./postgres-data:/var/lib/postgresql
 
-redis:
-restart: unless-stopped
-networks: - openshock
-image: redis/redis-stack-server:latest
-healthcheck:
-test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
-start_period: 20s
-interval: 30s
-retries: 5
-timeout: 3s
-volumes: - ./redis-data:/data # Same goes for redis
-environment: - "REDIS_ARGS=--notify-keyspace-events KEA"
+  dragonfly: # Redis-compatible store. Ex = emit expired-key events (used by the app)
+    image: ghcr.io/dragonflydb/dragonfly:latest
+    command: "--notify_keyspace_events=Ex"
+    restart: unless-stopped
+    networks:
+     - openshock
+    volumes:
+      - ./dragonfly-data:/data
 
-api:
-image: ghcr.io/openshock/api:latest
-restart: unless-stopped
-networks: - openshock
-depends_on: - db - redis
-env_file: .env
-environment:
-OPENSHOCK**FRONTEND**BASEURL: https://${OPENSHOCK_DOMAIN:-openshock.local}
-      OPENSHOCK__FRONTEND__SHORTURL: https://${OPENSHOCK_DOMAIN:-openshock.local}
-OPENSHOCK**FRONTEND**COOKIEDOMAIN: ${OPENSHOCK_DOMAIN:-openshock.local}
-      OPENSHOCK__DB__CONN: Host=db;Port=5432;Database=${PG_USER:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
-OPENSHOCK**REDIS**HOST: redis
-OPENSHOCK**TURNSTILE**ENABLE: false
-labels: - "traefik.enable=true" - "traefik.http.routers.openshock-api.rule=Host(`${OPENSHOCK_API_SUBDOMAIN:-api}.${OPENSHOCK_DOMAIN:-openshock.local}`)" - "traefik.http.routers.openshock-api.entrypoints=https" - "traefik.http.routers.openshock-api.tls=true" - "traefik.http.routers.openshock-api.service=openshock-api" - "traefik.http.services.openshock-api.loadbalancer.server.port=80"
-
-webui:
-image: ghcr.io/openshock/webui:latest
-restart: unless-stopped
-networks: - openshock
-environment:
-OPENSHOCK_NAME: OpenShock
-OPENSHOCK_URL: ${OPENSHOCK_DOMAIN:-openshock.local}
-      OPENSHOCK_SHARE_URL: https://${OPENSHOCK_DOMAIN:-openshock.local}
-OPENSHOCK_API_URL: https://${OPENSHOCK_API_SUBDOMAIN:-api}.${OPENSHOCK_DOMAIN:-openshock.local}
-labels: - "traefik.enable=true" - "traefik.http.routers.openshock-webui.rule=Host(`${OPENSHOCK_DOMAIN:-openshock.local}`)" - "traefik.http.routers.openshock-webui.entrypoints=https" - "traefik.http.routers.openshock-webui.tls=true" - "traefik.http.routers.openshock-webui.service=openshock-webui" - "traefik.http.routers.openshock-webui.middlewares=osr-s,osr-c,osr-t" - "traefik.http.services.openshock-webui.loadbalancer.server.port=80" - "traefik.http.middlewares.osr-s.redirectregex.regex=^https://${OPENSHOCK_DOMAIN:-openshock.local}/s/(.*)"
-      - "traefik.http.middlewares.osr-s.redirectregex.replacement=https://${OPENSHOCK_DOMAIN:-openshock.local}/#/public/proxy/shares/links/$$1"
-      - "traefik.http.middlewares.osr-c.redirectregex.regex=^https://${OPENSHOCK_DOMAIN:-openshock.local}/c/(.*)"
-      - "traefik.http.middlewares.osr-c.redirectregex.replacement=https://${OPENSHOCK_DOMAIN:-openshock.local}/#/public/proxy/shares/code/$$1" - "traefik.http.middlewares.osr-t.redirectregex.regex=^https://${OPENSHOCK_DOMAIN:-openshock.local}/t/(.*)"
-      - "traefik.http.middlewares.osr-t.redirectregex.replacement=https://${OPENSHOCK_DOMAIN:-openshock.local}/#/public/proxy/token/$$1"
-
-lcg:
-image: ghcr.io/openshock/live-control-gateway:latest
-restart: unless-stopped
-networks: - openshock
-depends_on: - db - redis
-environment:
-OPENSHOCK**REDIS**HOST: redis
-OPENSHOCK**DB**CONN: Host=db;Port=5432;Database=${PG_USER:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
-      OPENSHOCK__LCG__COUNTRYCODE: DE
-      OPENSHOCK__LCG__FQDN: ${OPENSHOCK_GATEWAY_SUBDOMAIN:-gateway}.${OPENSHOCK_DOMAIN:-openshock.local}
-labels: - "traefik.enable=true" - "traefik.http.routers.openshock-gateway.rule=Host(`${OPENSHOCK_GATEWAY_SUBDOMAIN:-gateway}.${OPENSHOCK_DOMAIN:-openshock.local}`)" - "traefik.http.routers.openshock-gateway.entrypoints=https" - "traefik.http.routers.openshock-gateway.tls=true" - "traefik.http.routers.openshock-gateway.service=openshock-gateway" - "traefik.http.services.openshock-gateway.loadbalancer.server.port=80"
-
-cron:
-image: ghcr.io/openshock/cron:latest
-restart: unless-stopped
-networks: - openshock
-depends_on: - db - redis
-environment:
-OPENSHOCK**REDIS**HOST: redis
-OPENSHOCK**DB**CONN: Host=db;Port=5432;Database=${PG_USER:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
+  api:
+    <<: *openshock-svc
+    image: ghcr.io/openshock/api:${OPENSHOCK_TAG:-latest}
+    environment:
+      <<: *openshock-env
+      # Path prefix the API is served under. Must match the PathPrefix router below.
+      OPENSHOCK__API__PATHBASE: ${OPENSHOCK_API_PATH:-/api}
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.openshock-cron.rule=Host(`${OPENSHOCK_DOMAIN:-localhost}`) && PathPrefix(`/hangfire`)" - "traefik.http.routers.openshock-cron.entrypoints=https" - "traefik.http.routers.openshock-cron.tls=true" - "traefik.http.routers.openshock-cron.service=openshock-cron" - "traefik.http.services.openshock-cron.loadbalancer.server.port=780"
+      - "traefik.http.routers.openshock-api.rule=Host(`${OPENSHOCK_HOST:-openshock.local}`) && PathPrefix(`${OPENSHOCK_API_PATH:-/api}`)"
+      - "traefik.http.routers.openshock-api.entrypoints=https"
+      - "traefik.http.routers.openshock-api.tls=true"
+      - "traefik.http.routers.openshock-api.service=openshock-api"
+      - "traefik.http.services.openshock-api.loadbalancer.server.port=80"
 
-traefik:
-image: traefik:latest
-container_name: traefik
-command:
-#- "--log.level=DEBUG" - "--providers.docker=true" - "--providers.docker.exposedbydefault=false" - "--entryPoints.https.address=:443"
-#- "--api.insecure=true"
-restart: unless-stopped
-networks: - openshock
-ports: - 80:80 - 443:443
-#- 8080:8080 # Traefik Web UI (enabled by --api.insecure=true)
-volumes: - /etc/localtime:/etc/localtime:ro - /var/run/docker.sock:/var/run/docker.sock:ro
+  frontend:
+    image: ghcr.io/openshock/frontend:${OPENSHOCK_FRONTEND_TAG:-latest}
+    restart: unless-stopped
+    networks:
+      - openshock
+    environment:
+      PUBLIC_SITE_NAME: OpenShock
+      PUBLIC_SITE_URL: https://${OPENSHOCK_HOST:-openshock.local}${OPENSHOCK_PORT:+:${OPENSHOCK_PORT}}${OPENSHOCK_FRONTEND_PATH:-}
+      PUBLIC_SITE_SHORT_URL: https://${OPENSHOCK_HOST:-openshock.local}${OPENSHOCK_PORT:+:${OPENSHOCK_PORT}}${OPENSHOCK_FRONTEND_PATH:-}
+      PUBLIC_BACKEND_API_URL: https://${OPENSHOCK_HOST:-openshock.local}${OPENSHOCK_PORT:+:${OPENSHOCK_PORT}}${OPENSHOCK_API_PATH:-/api}
+      # CSP connect-src allow-list for the gateway; the browser opens wss://host[:port].
+      PUBLIC_GATEWAY_CSP_WILDCARD: https://${OPENSHOCK_HOST:-openshock.local}${OPENSHOCK_PORT:+:${OPENSHOCK_PORT}}
+      PRIVATE_BACKEND_TLS_INSECURE: ${OPENSHOCK_FRONTEND_TLS_INSECURE:-false}
+    labels:
+      - "traefik.enable=true"
+      # Catch-all for the host; the api/gateway/cron PathPrefix routers are more specific and win.
+      - "traefik.http.routers.openshock-frontend.rule=Host(`${OPENSHOCK_HOST:-openshock.local}`)"
+      - "traefik.http.routers.openshock-frontend.entrypoints=https"
+      - "traefik.http.routers.openshock-frontend.tls=true"
+      - "traefik.http.routers.openshock-frontend.service=openshock-frontend"
+      - "traefik.http.services.openshock-frontend.loadbalancer.server.port=3000"
+
+  lcg:
+    <<: *openshock-svc
+    image: ghcr.io/openshock/live-control-gateway:${OPENSHOCK_TAG:-latest}
+    environment:
+      <<: *openshock-env
+      OPENSHOCK__LCG__COUNTRYCODE: ${OPENSHOCK_LCG_COUNTRYCODE:-DE}
+      # Public address the gateway advertises to firmware & browsers. PUBLICPATH must
+      # match the PathPrefix router below (the app serves under it via UsePathBase).
+      OPENSHOCK__LCG__FQDN: ${OPENSHOCK_HOST:-openshock.local}
+      OPENSHOCK__LCG__PUBLICPORT: ${OPENSHOCK_PORT:-443}
+      OPENSHOCK__LCG__PUBLICPATH: ${OPENSHOCK_GATEWAY_PATH:-/gateway}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openshock-gateway.rule=Host(`${OPENSHOCK_HOST:-openshock.local}`) && PathPrefix(`${OPENSHOCK_GATEWAY_PATH:-/gateway}`)"
+      - "traefik.http.routers.openshock-gateway.entrypoints=https"
+      - "traefik.http.routers.openshock-gateway.tls=true"
+      - "traefik.http.routers.openshock-gateway.service=openshock-gateway"
+      - "traefik.http.services.openshock-gateway.loadbalancer.server.port=80"
+
+  cron:
+    <<: *openshock-svc
+    image: ghcr.io/openshock/cron:${OPENSHOCK_TAG:-latest}
+    environment:
+      <<: *openshock-env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openshock-cron.rule=Host(`${OPENSHOCK_HOST:-openshock.local}`) && PathPrefix(`/hangfire`)"
+      - "traefik.http.routers.openshock-cron.entrypoints=https"
+      - "traefik.http.routers.openshock-cron.tls=true"
+      - "traefik.http.routers.openshock-cron.service=openshock-cron"
+      - "traefik.http.services.openshock-cron.loadbalancer.server.port=780"
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    command:
+      #- "--log.level=DEBUG"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entryPoints.https.address=:443"
+      #- "--api.insecure=true"
+    restart: unless-stopped
+    networks:
+      - openshock
+    ports:
+      - 80:80
+      # Publish the stack port (default 443) onto Traefik's https entrypoint.
+      - ${OPENSHOCK_PORT:-443}:443
+      #- 8080:8080 # Traefik Web UI (enabled by --api.insecure=true)
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 networks:
-openshock:
+  openshock:
 
 ````
 </Accordion>
@@ -146,240 +235,197 @@ openshock:
 <Accordions>
 <Accordion title=".env">
 ``` yaml
-# Required variables (uncomment and set values!)
-#PG_PASS=someSecurePassword(1)
+# OpenShock configuration. These are simple knobs; docker-compose.yml maps them
+# onto the OPENSHOCK__* variables the containers read and shares them across every
+# service. Anything left unset falls back to the defaults defined in the compose file.
 
-# Compose variables
-OPENSHOCK_DOMAIN=openshock.local #(2)
-OPENSHOCK_GATEWAY_SUBDOMAIN=gateway #(3)
-OPENSHOCK_API_SUBDOMAIN=api #(4)
+# --- Required ---
+# Database password (no default, must be set).
+PG_PASS=someSecurePassword
 
-#global email config
-OPENSHOCK__MAIL__SENDER__NAME=OpenShock System
-OPENSHOCK__MAIL__SENDER__EMAIL=system@openshock.app
+# --- Images ---
+# Tag for the backend images (api, gateway, cron) — they share the backend repo's
+# versioning. The frontend is a separate repo with its own versions, so it has its
+# own tag. Pin to a release for reproducible deploys; both default to `latest`.
+#OPENSHOCK_TAG=latest
+#OPENSHOCK_FRONTEND_TAG=latest
 
-#mail configs. uncomment one of the 2 sections below and make your config changes
+# --- Host / port / paths ---
+# The whole stack runs on one host and one port; services are told apart by path.
+# The host clients use to reach the stack.
+OPENSHOCK_HOST=openshock.local
+# External port for the stack. Leave blank for 443 (standard https). Set e.g. 8080
+# to serve on https://host:8080. Traefik publishes this onto its https entrypoint.
+#OPENSHOCK_PORT=8080
+# Path prefix per service. Frontend sits at the root; api and gateway on sub-paths.
+# Leave OPENSHOCK_FRONTEND_PATH blank to keep the web UI at the root (recommended).
+#OPENSHOCK_FRONTEND_PATH=
+OPENSHOCK_API_PATH=/api
+OPENSHOCK_GATEWAY_PATH=/gateway
 
-#MailJet
-#OPENSHOCK__MAIL__TYPE: MAILJET # MAILJET or SMTP, check Documentation
-#OPENSHOCK__MAIL__MAILJET__KEY: mailjetkey
-#OPENSHOCK__MAIL__MAILJET__SECRET: mailjetsecret
-#OPENSHOCK__MAIL__MAILJET__TEMPLATE__PASSWORDRESET: 9999999
+# --- Database (optional, defaults shown) ---
+#PG_USER=openshock
+#PG_DB=openshock
 
-#SMTP
-OPENSHOCK__MAIL__TYPE=SMTP # MAILJET or SMTP, check Documentation
-OPENSHOCK__MAIL__SMTP__HOST=mail.domain.zap
-OPENSHOCK__MAIL__SMTP__USERNAME=open@shock.zap
-OPENSHOCK__MAIL__SMTP__PASSWORD=SMTPPASSWORD
-OPENSHOCK__MAIL__SMTP__ENABLESSL=true
-OPENSHOCK__MAIL__SMTP__VERIFYCERTIFICATE=true
+# --- Feature flags (optional, defaults shown) ---
+#OPENSHOCK_TURNSTILE_ENABLE=false
+#OPENSHOCK_REGISTRATION_ENABLED=true
 
-````
+# --- TLS (optional, defaults shown) ---
+# Set this to true to disable TLS certificate verification for the frontend. This is useful
+# for testing with self-signed certs, but should not be used in production.
+#OPENSHOCK_FRONTEND_TLS_INSECURE=false
 
-1. Primary postgres database password. Make it something secure like a random 32 character password.
-2. Application domain. e.g. `openshock.app`
-3. Gateway subdomain. Can be left as is. e.g. `de1-gateway`
-4. API subdomain. Default is `api`
+# --- E-mail ---
+# MAIL_TYPE is required by the app. Leave it as None to run without outbound mail,
+# or set it to Smtp / Mailjet and fill in the matching block below.
+MAIL_TYPE=None
+MAIL_SENDER_NAME=OpenShock System
+MAIL_SENDER_EMAIL=system@openshock.app
+
+# SMTP (used when MAIL_TYPE=Smtp)
+#SMTP_HOST=mail.domain.zap
+#SMTP_PORT=587
+#SMTP_USERNAME=open@shock.zap
+#SMTP_PASSWORD=SMTPPASSWORD
+#SMTP_ENABLESSL=true
+#SMTP_VERIFYCERTIFICATE=true
+
+# Mailjet (used when MAIL_TYPE=Mailjet)
+#MAILJET_KEY=mailjetkey
+#MAILJET_SECRET=mailjetsecret
+
+```
 
 </Accordion>
 </Accordions>
 These two can also be found in the [API repository](https://github.com/OpenShock/API)
 
-#### Variables that must be changed in `.env`:
-
-- `PG_PASS` is your primary postgres database password. Make it something secure like a random 32 character password.
-- `OPENSHOCK_DOMAIN` change this to your domain name. e.g. openshock.app
-- Email configuration. You need to decide between SMTP and MAILJET for your email sending service. Email server is currently required, this may change in the future.
-
-You can change other variables in the `docker-compose.yml`. Check the [API README](https://github.com/OpenShock/API) for more information on the environment variables.
-
-PS: the .env file is only actually used for variables in the docker-compose file itself and as the env_file for the api container. Feel free to change this.
-
 ### Reverse proxy
 
 By default the reverse proxy that comes with this example is traefik. Everything should be setup and should be available under https on port 443 on your domain if done correctly.
 
-If you decide to have your own reverse proxy or just straight up use a different domain for short urls, you need to setup redirects.
-
-- `/s/$` -> `/#/public/proxy/shares/links/$`
-- `/c/$` -> `/#/public/proxy/shares/code/$`
-- `/t/$` -> `/#/public/proxy/token/$`
-
-There is a short hand letter, that redirects to the webui url, with this prefix added, and `$` being a placeholder.
-
-This setup also assumes that your frontend is for example under `openshock.app`. And API and Gateway are subdomains of the current domain name.
-If you want to have your frontend also be under a subdomain, you will need to edit the reverse proxy todo so. And set the frontend urls environment variables accordingly.
-
-#### NGINX reverse proxy example with custom SSL
-
-We can use this modified docker-compose.yml, difference here is, we removed traefik and added nginx.
-In addition we also need a ssl certificate, change the path to your needs, and create a `nginx-site.conf` file.
-
-<Accordions>
-<Accordion title="docker-compose.yml">
-```yaml
-
-# Minimal example for nginx
-
-services:
-
-db: # We need a postgres database, preferably version 15+
-image: postgres:16
-restart: unless-stopped
-container_name: openshock-postgres
-healthcheck:
-test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
-start_period: 20s
-interval: 30s
-retries: 5
-timeout: 5s
-networks: - openshock
-environment:
-POSTGRES_PASSWORD: ${PG_PASS:?database password required}
-POSTGRES_USER: ${PG_USER:-openshock}
-POSTGRES_DB: ${PG_DB:-openshock}
-volumes: - ./postgres-data:/var/lib/postgresql/data # Data is saved in a folder called postgres-data in the current working directory
-
-redis:
-restart: unless-stopped
-networks: - openshock
-image: redis/redis-stack-server:latest
-healthcheck:
-test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
-start_period: 20s
-interval: 30s
-retries: 5
-timeout: 3s
-volumes: - ./redis-data:/data # Same goes for redis
-environment: - "REDIS_ARGS=--notify-keyspace-events KEA"
-
-api:
-image: ghcr.io/openshock/api:latest
-restart: unless-stopped
-networks: - openshock
-depends_on: - db - redis
-env_file: .env
-environment:
-OPENSHOCK**FRONTEND**BASEURL: https://${OPENSHOCK_DOMAIN:-openshock.local}
-      OPENSHOCK__FRONTEND__SHORTURL: https://${OPENSHOCK_DOMAIN:-openshock.local}
-OPENSHOCK**FRONTEND**COOKIEDOMAIN: ${OPENSHOCK_DOMAIN:-openshock.local}
-      OPENSHOCK__DB__CONN: Host=db;Port=5432;Database=${PG_USER:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
-OPENSHOCK**REDIS**HOST: redis
-OPENSHOCK**TURNSTILE**ENABLE: false
-
-webui:
-image: ghcr.io/openshock/webui:latest
-restart: unless-stopped
-networks: - openshock
-environment:
-OPENSHOCK_NAME: OpenShock
-OPENSHOCK_URL: ${OPENSHOCK_DOMAIN:-openshock.local}
-      OPENSHOCK_SHARE_URL: https://${OPENSHOCK_DOMAIN:-openshock.local}
-OPENSHOCK_API_URL: https://${OPENSHOCK_API_SUBDOMAIN:-api}.${OPENSHOCK_DOMAIN:-openshock.local}
-
-lcg:
-image: ghcr.io/openshock/live-control-gateway:latest
-restart: unless-stopped
-networks: - openshock
-depends_on: - db - redis
-environment:
-OPENSHOCK**REDIS**HOST: redis
-OPENSHOCK**DB**CONN: Host=db;Port=5432;Database=${PG_USER:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
-      OPENSHOCK__LCG__COUNTRYCODE: DE
-      OPENSHOCK__LCG__FQDN: ${OPENSHOCK_GATEWAY_SUBDOMAIN:-gateway}.${OPENSHOCK_DOMAIN:-openshock.local}
-
-cron:
-image: ghcr.io/openshock/cron:master
-restart: unless-stopped
-networks: - openshock
-depends_on: - db - redis
-environment:
-OPENSHOCK**REDIS**HOST: redis
-OPENSHOCK**DB**CONN: Host=db;Port=5432;Database=${PG_USER:-openshock};Username=${PG_USER:-openshock};Password=${PG_PASS}
-
-nginx:
-image: nginx
-restart: unless-stopped
-networks: - openshock
-ports: - 80:80 - 443:443
-volumes: - ./nginx-site.conf:/etc/nginx/conf.d/nginx-site.conf - ./certs:/certs
-
-networks:
-openshock:
-
-````
-</Accordion>
-</Accordions>
-**You will need to change the server names here!**
-
-<Accordions>
-<Accordion title="nginx-site.conf">
-```yaml
-
-server {
-    listen 443 ssl;
-    server_name openshock.local;
-    ssl_certificate /certs/fullchain.pem;
-    ssl_certificate_key /certs/privkey.pem;
-
-    # Redirect /s/<anything> to /#/public/proxy/shares/links/<anything>
-    location ~ ^/s/(.*)$ {
-        return 301 /#/public/proxy/shares/links/$1;
-    }
-
-    # Redirect /c/<anything> to /#/public/proxy/shares/code/<anything>
-    location ~ ^/c/(.*)$ {
-        return 301 /#/public/proxy/shares/code/$1;
-    }
-
-    # Redirect /t/<anything> to /#/public/proxy/token/<anything>
-    location ~ ^/t/(.*)$ {
-        return 301 /#/public/proxy/shares/token/$1;
-    }
-
-    location / {
-        proxy_pass http://webui:80;
-        proxy_set_header Host $host;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade
-    }
-}
-
-
-server {
-    listen 443 ssl;
-    server_name api.openshock.local;
-    ssl_certificate /certs/fullchain.pem;
-    ssl_certificate_key /certs/privkey.pem;
-
-    location / {
-        proxy_pass http://api:80;
-        proxy_set_header Host $host;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade
-    }
-}
-
-server {
-    listen 443 ssl;
-    server_name gateway.openshock.local;
-    ssl_certificate /certs/fullchain.pem;
-    ssl_certificate_key /certs/privkey.pem;
-
-    location / {
-        proxy_pass http://lcg:80;
-        proxy_set_header Host $host;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade
-    }
-}
-
-````
-
-</Accordion>
-</Accordions>
 ## Done
 
 Congratulations, the backend and website should be working now. :partying_face:
 
 You can now set the backend domain for the firmware to your api url via the `domain` serial command.
+
+## Migrating from the old docker compose setup
+
+If you are running the previous subdomain-based stack (`api.example.com` /
+`gateway.example.com` plus the `webui` container), read this before you pull.
+
+<Callout type="warn" title="Back up first">
+  Back up your `postgres-data` folder before starting. The Postgres upgrade and the
+  volume path change below both touch persistent data.
+</Callout>
+
+### What changed
+
+| Old                                                    | New                                                                   |
+| ------------------------------------------------------ | --------------------------------------------------------------------- |
+| Subdomains: `api.`, `gateway.`, UI on the root          | One host, one port, split by path: `/api`, `/gateway`, UI on `/`       |
+| `webui` container (`ghcr.io/openshock/webui`, port 80)  | `frontend` container (`ghcr.io/openshock/frontend`, port 3000)         |
+| `redis/redis-stack-server`, keyspace events `KEA`       | DragonflyDB, keyspace events `Ex`                                      |
+| `postgres:17`, volume at `/var/lib/postgresql/data`     | `postgres:18`, volume at `/var/lib/postgresql`                         |
+| `.env` holds raw `OPENSHOCK__*` variables               | `.env` holds short knobs, the compose file maps them to `OPENSHOCK__*` |
+| Images pinned to `latest`                               | `OPENSHOCK_TAG` / `OPENSHOCK_FRONTEND_TAG`                             |
+| Traefik `redirectregex` rules for `/s/`, `/c/`, `/t/`   | Handled by the frontend itself (`/c/` is now `/usc/`)                  |
+
+### 1. Postgres 17 → 18
+
+Postgres 18 will not start on a 17 data directory, and the mount point moved (PG18 keeps
+its data in `postgres-data/18/docker`). Dump on the **old** stack first:
+
+```bash
+docker compose exec db pg_dump -U openshock -d openshock -Fc > openshock.dump
+docker compose down
+mv postgres-data postgres-data-17-backup
+```
+
+Then start the new stack's database and restore into it:
+
+```bash
+docker compose up -d db
+docker compose exec -T db pg_restore -U openshock -d openshock < openshock.dump
+```
+
+### 2. Redis → Dragonfly
+
+Nothing to migrate — only cache and ephemeral state lived there. Delete `./redis-data`
+once the new stack is running. If you keep your own Redis instead of Dragonfly, set its
+keyspace events to at least `Ex`.
+
+### 3. Check your database name
+
+The old compose file built the connection string with `Database=${PG_USER}` while it
+created `POSTGRES_DB=${PG_DB}`, so the database in use was actually named after the
+**user**. This is fixed now. If you had set `PG_USER` and `PG_DB` to different values,
+your data lives in the database named after `PG_USER` — set `PG_DB` to that name, or
+restore your dump into `PG_DB`.
+
+### 4. Rewrite your `.env`
+
+Copy the new `.env` from above and port your values across:
+
+| Old (`.env`)                                       | New (`.env`)                                                                                            |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `OPENSHOCK_DOMAIN`                                  | `OPENSHOCK_HOST`                                                                                          |
+| `OPENSHOCK_API_SUBDOMAIN`                           | `OPENSHOCK_API_PATH` (default `/api`)                                                                     |
+| `OPENSHOCK_GATEWAY_SUBDOMAIN`                       | `OPENSHOCK_GATEWAY_PATH` (default `/gateway`)                                                             |
+| `OPENSHOCK__MAIL__TYPE=SMTP`                        | `MAIL_TYPE=Smtp` — or `Mailjet`, or `None` for no outbound mail                                           |
+| `OPENSHOCK__MAIL__SENDER__NAME` / `__EMAIL`         | `MAIL_SENDER_NAME` / `MAIL_SENDER_EMAIL`                                                                  |
+| `OPENSHOCK__MAIL__SMTP__*`                          | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_ENABLESSL`, `SMTP_VERIFYCERTIFICATE`    |
+| `OPENSHOCK__MAIL__MAILJET__KEY` / `__SECRET`        | `MAILJET_KEY` / `MAILJET_SECRET`                                                                          |
+| `OPENSHOCK__MAIL__MAILJET__TEMPLATE__PASSWORDRESET` | Gone — mail templates are generated now                                                                   |
+| `OPENSHOCK__TURNSTILE__ENABLE`                      | `OPENSHOCK_TURNSTILE_ENABLE`                                                                              |
+| `OPENSHOCK__ACCOUNT__REGISTRATIONENABLED`           | `OPENSHOCK_REGISTRATION_ENABLED`                                                                          |
+| `OPENSHOCK__LCG__COUNTRYCODE`                       | `OPENSHOCK_LCG_COUNTRYCODE`                                                                               |
+
+`PG_PASS`, `PG_USER` and `PG_DB` keep their names.
+
+<Callout type="warn" title="Extra variables no longer pass through">
+  The old `api` service had `env_file: .env`, so any extra `OPENSHOCK__*` variable you
+  dropped into `.env` reached the container automatically. It does not anymore. Anything
+  not in the table above has to be added explicitly to the `x-openshock-env` block
+  (shared by api, cron and lcg) or to the individual service.
+</Callout>
+
+New knobs worth knowing:
+
+- `OPENSHOCK_PORT` — serve the stack on a non-443 port. Leave blank for 443.
+- `OPENSHOCK_TAG` / `OPENSHOCK_FRONTEND_TAG` — pin images instead of tracking `latest`.
+  The frontend is a separate repository and versions independently of the backend.
+- `OPENSHOCK_FRONTEND_TLS_INSECURE` — skip backend certificate verification from the
+  frontend. For testing with self-signed certs only, never in production.
+
+### 5. DNS and certificates
+
+Only one hostname is needed now, so you can drop the `api.` and `gateway.` DNS records
+and use a single-name certificate instead of a wildcard. Keep the old records pointed at
+the server until every client has moved over.
+
+### 6. Clients and firmware
+
+The gateway now advertises host, port and path prefix (`OPENSHOCK__LCG__PUBLICPORT`,
+`OPENSHOCK__LCG__PUBLICPATH`) rather than a bare FQDN, and devices pick that up from the
+API when they reconnect. Check that your firmware and client versions understand a
+gateway path prefix before cutting over — in this single-host layout you cannot avoid it
+by blanking `OPENSHOCK_GATEWAY_PATH`, because the frontend owns the root and the gateway
+needs a prefix of its own to be routable.
+
+### 7. Bring it up
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+The UI is on `https://<host>/`, the API docs on `https://<host>/api/scalar/viewer` and
+Hangfire on `https://<host>/hangfire`.
+
+Using your own reverse proxy? Remove the `traefik` service and route by path: `/` →
+`frontend:3000`, `OPENSHOCK_API_PATH` → `api:80`, `OPENSHOCK_GATEWAY_PATH` → `lcg:80`,
+`/hangfire` → `cron:780`. Do **not** strip the prefixes — each app serves under its own
+`UsePathBase`.
