@@ -1,6 +1,6 @@
 <center><div align="center">
 
-<img alt="OpenShock Logo" height="150px" width="150px" src="https://openshock.org/IconSlowSpin.svg" />
+<img alt="OpenShock Logo" height="150px" width="150px" src="https://openshock.org/branding/Icon/IconLoadingSpin.svg" />
 
 <h1><b>OpenShock Wiki</b></h1>
 
@@ -11,7 +11,7 @@
 
 ## Development
 
-This documentation site is built with [VitePress](https://vitepress.dev).
+This documentation site is built with Fumadocs.
 
 ### Local preview
 
