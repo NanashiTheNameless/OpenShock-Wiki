@@ -1,2 +1,6 @@
+# Domain-level rules first — the path-only rules below match on any host.
+https://pishock.org/*      https://pishock.com/  301
+https://www.pishock.org/*  https://pishock.com/  301
+
 /                   /home/           301
 /legal/*            /home/legal/:splat  301
